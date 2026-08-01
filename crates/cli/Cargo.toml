@@ -1,0 +1,21 @@
+[package]
+name = "treeportfs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "treeportfs"
+path = "src/main.rs"
+
+[dependencies]
+treeportfs-core.workspace = true
+treeportfs-git.workspace = true
+treeportfs-nfs.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+nfsserve.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

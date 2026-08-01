@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/hybrist/treeportfs"
+
+[workspace.dependencies]
+treeportfs-core = { path = "crates/core" }
+treeportfs-git = { path = "crates/git" }
+treeportfs-nfs = { path = "crates/nfs" }
+
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+nfsserve = "0.10"
+filetime = "0.2"
+dirs = "6"
