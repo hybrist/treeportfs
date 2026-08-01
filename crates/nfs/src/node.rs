@@ -65,6 +65,10 @@ pub struct State {
     pub tries: HashMap<(String, String), CachedTrie>,
     /// Negative cache: repos the remote said don't exist (or aren't visible).
     pub missing_repos: HashMap<(String, String), Instant>,
+    /// Last fetch/fast-forward attempt per worktree root node.
+    pub wt_refresh: HashMap<fileid3, Instant>,
+    /// Default branch per (org, repo).
+    pub default_branches: HashMap<(String, String), String>,
 }
 
 impl State {
@@ -130,6 +134,19 @@ impl State {
         if let Some(id) = removed {
             self.nodes.remove(&id);
             self.touch(parent);
+        }
+    }
+
+    /// The `Worktree` root node containing `id` (or `id` itself).
+    pub fn worktree_root(&self, id: fileid3) -> Option<fileid3> {
+        let mut cur = id;
+        loop {
+            let node = self.nodes.get(&cur)?;
+            match &node.kind {
+                NodeKind::Worktree { .. } => return Some(cur),
+                NodeKind::Disk => cur = node.parent,
+                _ => return None,
+            }
         }
     }
 

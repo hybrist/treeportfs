@@ -69,6 +69,24 @@ cd ~/github/octocat/Hello-World/refs/master
 git status && git log --oneline
 ```
 
+### Branch lifecycle via the filesystem
+
+Directories under `refs/` *are* branches, and directory operations map to
+branch operations:
+
+- **`mkdir refs/<name>` creates a branch**: a new local branch + worktree
+  forked from the remote's default branch, with upstream preconfigured so a
+  plain `git push` from inside creates the remote branch. (`gh pr create`
+  works from the worktree directory too.)
+- **`rm -rf refs/<name>` deletes the branch everywhere**: the worktree, the
+  local branch, **and the remote branch** (a failed remote delete — e.g. a
+  protected default branch — is logged and ignored).
+- **Clean worktrees follow their remote branch automatically**: on access
+  (after the `--branch-ttl` window) a worktree is fetched and fast-forwarded,
+  but only when it has no uncommitted changes and no local commits — your
+  work is never touched. After a PR merges, `ls refs/main` shows the merged
+  state without a manual pull.
+
 Notes:
 
 - The mount root starts empty — orgs appear once you access a repo under

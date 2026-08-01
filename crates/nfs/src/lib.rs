@@ -199,7 +199,66 @@ impl TreeportFs {
         if let Some(n) = st.nodes.get_mut(&id) {
             n.kind = NodeKind::Worktree { root: root.clone() };
         }
+        // Freshly materialized: skip the first refresh window.
+        st.wt_refresh.insert(id, Instant::now());
         Ok(root)
+    }
+
+    /// Keeps a worktree tracking its remote branch: after `branch_ttl`,
+    /// fetch and fast-forward — but only when the worktree is clean and has
+    /// no local commits, so user work is never touched. Called on worktree
+    /// access; `id` may be any node inside the worktree.
+    async fn maybe_refresh_worktree(&self, id: fileid3) {
+        let ctx = {
+            let mut st = self.state.lock().unwrap();
+            let Some(root_id) = st.worktree_root(id) else {
+                return;
+            };
+            let fresh = st
+                .wt_refresh
+                .get(&root_id)
+                .is_some_and(|t| t.elapsed() < self.git.config().branch_ttl);
+            if fresh {
+                return;
+            }
+            // Stamp before fetching so concurrent lookups don't pile up.
+            st.wt_refresh.insert(root_id, Instant::now());
+            st.refs_context(root_id)
+        };
+        let Some((org, repo, segs)) = ctx else {
+            return;
+        };
+        let branch = segs.join("/");
+        let _gate = self.git_gate.lock().await;
+        let git = self.git.clone();
+        let (o, r, b) = (org.clone(), repo.clone(), branch.clone());
+        let res = tokio::task::spawn_blocking(move || git.refresh_worktree(&o, &r, &b)).await;
+        match res {
+            Ok(Ok(true)) => debug!("refreshed {org}/{repo}@{branch}"),
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => warn!("refresh of {org}/{repo}@{branch} failed: {e}"),
+            Err(e) => warn!("refresh task panicked: {e}"),
+        }
+    }
+
+    /// Default branch of a repo, cached for the server lifetime.
+    async fn default_branch_for(&self, org: &str, repo: &str) -> Result<String, nfsstat3> {
+        let key = (org.to_string(), repo.to_string());
+        if let Some(b) = self.state.lock().unwrap().default_branches.get(&key) {
+            return Ok(b.clone());
+        }
+        let git = self.git.clone();
+        let (o, r) = key.clone();
+        let base = tokio::task::spawn_blocking(move || git.default_branch(&o, &r))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        self.state
+            .lock()
+            .unwrap()
+            .default_branches
+            .insert(key, base.clone());
+        Ok(base)
     }
 }
 
@@ -275,6 +334,8 @@ fn paginate(
 /// What `lookup` decided to do after the first (locked) inspection phase.
 enum LookupPlan {
     Done(fileid3),
+    /// An existing worktree: give it a chance to fetch/fast-forward first.
+    Worktree(fileid3),
     /// Validate `org/<name>` against the remote, then create the repo node.
     ProbeRepo { org: String, name: String },
     /// Resolve a path in the refs namespace against the branch trie.
@@ -348,21 +409,29 @@ impl NFSFileSystem for TreeportFs {
                     None => return Err(nfsstat3::NFS3ERR_NOENT),
                 },
                 NodeKind::RefsRoot | NodeKind::RefPath => {
-                    // If the child is already a materialized worktree we're
-                    // done; otherwise consult the trie (it may be a branch
-                    // needing materialization, or an intermediate segment).
-                    if let Some(id) = existing {
-                        if matches!(st.get(id).map(|n| &n.kind), Some(NodeKind::Worktree { .. })) {
-                            return Ok(id);
+                    // A materialized worktree only needs its periodic
+                    // refresh; anything else is resolved against the trie
+                    // (a branch needing materialization, or an intermediate
+                    // segment).
+                    match existing {
+                        Some(id)
+                            if matches!(
+                                st.get(id).map(|n| &n.kind),
+                                Some(NodeKind::Worktree { .. })
+                            ) =>
+                        {
+                            LookupPlan::Worktree(id)
+                        }
+                        _ => {
+                            if !valid_component(&name) {
+                                return Err(nfsstat3::NFS3ERR_NOENT);
+                            }
+                            let (org, repo, mut segs) =
+                                st.refs_context(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
+                            segs.push(name.clone());
+                            LookupPlan::Refs { org, repo, segs, existing }
                         }
                     }
-                    if !valid_component(&name) {
-                        return Err(nfsstat3::NFS3ERR_NOENT);
-                    }
-                    let (org, repo, mut segs) =
-                        st.refs_context(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
-                    segs.push(name.clone());
-                    LookupPlan::Refs { org, repo, segs, existing }
                 }
                 NodeKind::Worktree { .. } | NodeKind::Disk => {
                     if let Some(id) = existing {
@@ -383,6 +452,10 @@ impl NFSFileSystem for TreeportFs {
 
         match plan {
             LookupPlan::Done(id) => Ok(id),
+            LookupPlan::Worktree(id) => {
+                self.maybe_refresh_worktree(id).await;
+                Ok(id)
+            }
             LookupPlan::ProbeRepo { org, name } => {
                 // ls-remote both validates the repo and warms the trie cache.
                 self.get_trie(&org, &name).await?;
@@ -396,23 +469,34 @@ impl NFSFileSystem for TreeportFs {
             }
             LookupPlan::Refs { org, repo, segs, existing } => {
                 let trie = self.get_trie(&org, &repo).await?;
+                let name = segs.last().unwrap().clone();
                 let Some(tn) = trie.node(&segs) else {
+                    // Not on the remote — but it may be a local-only branch
+                    // (created via mkdir, not yet pushed) whose worktree
+                    // survived a server restart.
+                    let wt = self.git.config().worktree_path(&org, &repo, &segs.join("/"));
+                    if wt.join(".git").exists() {
+                        let mut st = self.state.lock().unwrap();
+                        return Ok(st.add_child(dirid, &name, NodeKind::Worktree { root: wt }));
+                    }
                     return Err(nfsstat3::NFS3ERR_NOENT);
                 };
-                let name = segs.last().unwrap().clone();
                 if tn.is_branch {
                     let branch = segs.join("/");
                     let root = self.materialize(&org, &repo, &branch).await?;
                     let mut st = self.state.lock().unwrap();
-                    match existing {
+                    let id = match existing {
                         Some(id) => {
                             if let Some(n) = st.nodes.get_mut(&id) {
                                 n.kind = NodeKind::Worktree { root };
                             }
-                            Ok(id)
+                            id
                         }
-                        None => Ok(st.add_child(dirid, &name, NodeKind::Worktree { root })),
-                    }
+                        None => st.add_child(dirid, &name, NodeKind::Worktree { root }),
+                    };
+                    // Freshly materialized: skip the first refresh window.
+                    st.wt_refresh.insert(id, Instant::now());
+                    Ok(id)
                 } else {
                     let mut st = self.state.lock().unwrap();
                     Ok(existing.unwrap_or_else(|| st.add_child(dirid, &name, NodeKind::RefPath)))
@@ -511,6 +595,60 @@ impl NFSFileSystem for TreeportFs {
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let name = str_name(dirname)?.to_string();
+        // In the refs namespace, mkdir means "create a branch": fork a new
+        // local branch + worktree off the remote's default branch, with
+        // upstream preconfigured so `git push` creates the remote branch.
+        let refs_ctx = {
+            let st = self.state.lock().unwrap();
+            let dir = st.get(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
+            match dir.kind {
+                NodeKind::RefsRoot | NodeKind::RefPath => {
+                    if dir.children.contains_key(&name) {
+                        return Err(nfsstat3::NFS3ERR_EXIST);
+                    }
+                    if !valid_component(&name) {
+                        return Err(nfsstat3::NFS3ERR_ACCES);
+                    }
+                    let (org, repo, mut segs) =
+                        st.refs_context(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
+                    segs.push(name.clone());
+                    Some((org, repo, segs))
+                }
+                _ => None,
+            }
+        };
+        if let Some((org, repo, segs)) = refs_ctx {
+            let trie = self.get_trie(&org, &repo).await?;
+            if trie.node(&segs).is_some() {
+                return Err(nfsstat3::NFS3ERR_EXIST);
+            }
+            let branch = segs.join("/");
+            let base = self.default_branch_for(&org, &repo).await?;
+            let _gate = self.git_gate.lock().await;
+            let git = self.git.clone();
+            let (o, r, b, base2) = (org.clone(), repo.clone(), branch.clone(), base.clone());
+            let root = tokio::task::spawn_blocking(move || {
+                git.create_branch_worktree(&o, &r, &b, &base2)
+            })
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| match e {
+                GitError::CommandFailed { ref stderr, .. }
+                    if stderr.contains("already exists") =>
+                {
+                    nfsstat3::NFS3ERR_EXIST
+                }
+                other => {
+                    warn!("branch creation {org}/{repo}@{branch} failed: {other}");
+                    nfsstat3::NFS3ERR_IO
+                }
+            })?;
+            let mut st = self.state.lock().unwrap();
+            let id = st.add_child(dirid, &name, NodeKind::Worktree { root: root.clone() });
+            st.wt_refresh.insert(id, Instant::now());
+            drop(st);
+            return Ok((id, self.attr_for_path(id, &root)?));
+        }
         if !valid_disk_name(&name) {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
@@ -523,6 +661,56 @@ impl NFSFileSystem for TreeportFs {
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         let name = str_name(filename)?.to_string();
+        // In the refs namespace, removing a branch directory deletes the
+        // branch everywhere: worktree, local branch, and the remote branch.
+        let refs_ctx = {
+            let st = self.state.lock().unwrap();
+            let dir = st.get(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
+            match dir.kind {
+                NodeKind::RefsRoot | NodeKind::RefPath => {
+                    let (org, repo, mut segs) =
+                        st.refs_context(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
+                    segs.push(name.clone());
+                    let child_is_worktree = dir.children.get(&name).is_some_and(|id| {
+                        matches!(st.get(*id).map(|n| &n.kind), Some(NodeKind::Worktree { .. }))
+                    });
+                    Some((org, repo, segs, child_is_worktree))
+                }
+                _ => None,
+            }
+        };
+        if let Some((org, repo, segs, child_is_worktree)) = refs_ctx {
+            if !child_is_worktree {
+                // Not materialized locally: only allow deleting things that
+                // are actually branches (not intermediate segments).
+                let trie = self.get_trie(&org, &repo).await?;
+                match trie.node(&segs) {
+                    Some(tn) if tn.is_branch => {}
+                    Some(_) => return Err(nfsstat3::NFS3ERR_ACCES),
+                    None => return Err(nfsstat3::NFS3ERR_NOENT),
+                }
+            }
+            let branch = segs.join("/");
+            let _gate = self.git_gate.lock().await;
+            let git = self.git.clone();
+            let (o, r, b) = (org.clone(), repo.clone(), branch.clone());
+            tokio::task::spawn_blocking(move || git.delete_branch(&o, &r, &b))
+                .await
+                .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                .map_err(|e| {
+                    warn!("branch deletion {org}/{repo}@{branch} failed: {e}");
+                    nfsstat3::NFS3ERR_IO
+                })?;
+            let mut st = self.state.lock().unwrap();
+            if let Some(id) = st.get(dirid).and_then(|d| d.children.get(&name)).copied() {
+                st.wt_refresh.remove(&id);
+            }
+            st.remove_child(dirid, &name);
+            // Force the next refs listing to re-query the remote so the
+            // deleted branch doesn't linger from the cached trie.
+            st.tries.remove(&(org, repo));
+            return Ok(());
+        }
         if !valid_disk_name(&name) {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
@@ -631,31 +819,69 @@ impl NFSFileSystem for TreeportFs {
 
         let entries = match plan {
             Plan::Virtual(entries) => entries,
-            Plan::Disk(path) => self.disk_entries(dirid, &path)?,
+            Plan::Disk(path) => {
+                // Listing inside a worktree: opportunity to fetch and
+                // fast-forward a clean checkout (TTL-throttled).
+                self.maybe_refresh_worktree(dirid).await;
+                self.disk_entries(dirid, &path)?
+            }
             Plan::Refs { org, repo, segs } => {
                 let trie = self.get_trie(&org, &repo).await?;
-                let Some(tn) = trie.node(&segs) else {
-                    return Err(nfsstat3::NFS3ERR_NOENT);
-                };
-                if tn.is_branch {
-                    // Listing a branch dir that was never looked up as a
-                    // leaf: materialize it now.
-                    let root = self.ensure_branch_dir(dirid, &org, &repo, &segs).await?;
-                    self.disk_entries(dirid, &root)?
-                } else {
-                    let names: Vec<String> = tn.children.keys().cloned().collect();
-                    let mut st = self.state.lock().unwrap();
-                    names
-                        .into_iter()
-                        .map(|name| {
-                            let id = st.add_child(dirid, &name, NodeKind::RefPath);
-                            DirEntry {
-                                fileid: id,
-                                name: name.as_bytes().into(),
-                                attr: self.virtual_dir_attr(&st, id),
-                            }
-                        })
-                        .collect()
+                match trie.node(&segs) {
+                    Some(tn) if tn.is_branch => {
+                        // Listing a branch dir that was never looked up as a
+                        // leaf: materialize it now.
+                        let root = self.ensure_branch_dir(dirid, &org, &repo, &segs).await?;
+                        self.disk_entries(dirid, &root)?
+                    }
+                    tn => {
+                        // Remote branches from the trie, plus local-only
+                        // branches (created via mkdir, not yet pushed) that
+                        // exist as worktree children.
+                        let mut names: std::collections::BTreeSet<String> = tn
+                            .map(|t| t.children.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let mut st = self.state.lock().unwrap();
+                        let local: Vec<String> = st
+                            .get(dirid)
+                            .map(|d| {
+                                d.children
+                                    .iter()
+                                    .filter(|(_, id)| {
+                                        matches!(
+                                            st.get(**id).map(|n| &n.kind),
+                                            Some(NodeKind::Worktree { .. })
+                                        )
+                                    })
+                                    .map(|(n, _)| n.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        // A path outside the trie with no local branches
+                        // doesn't exist; an empty-but-valid dir (e.g. refs of
+                        // a repo with no branches) lists as empty.
+                        if tn.is_none() && local.is_empty() {
+                            return Err(nfsstat3::NFS3ERR_NOENT);
+                        }
+                        names.extend(local);
+                        names
+                            .into_iter()
+                            .map(|name| {
+                                let id = st.add_child(dirid, &name, NodeKind::RefPath);
+                                let attr = match st.disk_path(id) {
+                                    Some(p) => self
+                                        .attr_for_path(id, &p)
+                                        .unwrap_or_else(|_| self.virtual_dir_attr(&st, id)),
+                                    None => self.virtual_dir_attr(&st, id),
+                                };
+                                DirEntry {
+                                    fileid: id,
+                                    name: name.as_bytes().into(),
+                                    attr,
+                                }
+                            })
+                            .collect()
+                    }
                 }
             }
         };

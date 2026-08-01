@@ -146,6 +146,120 @@ impl GitCache {
         Ok(wt)
     }
 
+    /// The remote's default branch (symref target of HEAD), e.g. `main`.
+    pub fn default_branch(&self, org: &str, repo: &str) -> Result<String> {
+        let url = self.cfg.remote_url(org, repo);
+        let out = self.run_git(None, &["ls-remote", "--symref", &url, "HEAD"])?;
+        Ok(out
+            .lines()
+            .find_map(|l| l.strip_prefix("ref: refs/heads/"))
+            .and_then(|rest| rest.split('\t').next())
+            .unwrap_or("main")
+            .to_string())
+    }
+
+    /// Creates a new local branch + worktree forked from `origin/<base>`.
+    ///
+    /// The branch's upstream is configured to `origin/<branch>` (which does
+    /// not exist yet), so a plain `git push` from inside the worktree
+    /// creates the remote branch.
+    pub fn create_branch_worktree(
+        &self,
+        org: &str,
+        repo: &str,
+        branch: &str,
+        base: &str,
+    ) -> Result<PathBuf> {
+        let bare = self.ensure_bare(org, repo)?;
+        let _ = self.run_git(Some(&bare), &["worktree", "prune"]);
+        let wt = self.cfg.worktree_path(org, repo, branch);
+        if let Some(parent) = wt.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let wt_str = wt.to_string_lossy().into_owned();
+        let start = format!("origin/{base}");
+        info!("creating branch {org}/{repo}@{branch} from {start}");
+        self.run_git(
+            Some(&bare),
+            &[
+                "worktree", "add", "--no-track", "-b", branch, &wt_str, &start,
+            ],
+        )?;
+        self.run_git(
+            Some(&bare),
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        )?;
+        self.run_git(
+            Some(&bare),
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        )?;
+        Ok(wt)
+    }
+
+    /// Deletes a branch everywhere: worktree directory, worktree
+    /// bookkeeping, local branch, and the remote branch. Local cleanup
+    /// errors are ignored (the pieces may already be gone); a failed remote
+    /// delete is only logged unless the remote ref was already absent.
+    pub fn delete_branch(&self, org: &str, repo: &str, branch: &str) -> Result<()> {
+        let wt = self.cfg.worktree_path(org, repo, branch);
+        let _ = std::fs::remove_dir_all(&wt);
+        let bare = self.cfg.bare_repo_path(org, repo);
+        if !bare.join("HEAD").exists() {
+            return Ok(());
+        }
+        let _ = self.run_git(Some(&bare), &["worktree", "prune"]);
+        let _ = self.run_git(Some(&bare), &["branch", "-D", branch]);
+        info!("deleting remote branch {org}/{repo}@{branch}");
+        if let Err(e) = self.run_git(Some(&bare), &["push", "origin", "--delete", branch]) {
+            match &e {
+                GitError::CommandFailed { stderr, .. }
+                    if stderr.contains("remote ref does not exist") => {}
+                other => tracing::warn!("remote branch delete failed: {other}"),
+            }
+        }
+        let _ = self.run_git(Some(&bare), &["fetch", "--prune", "--no-tags", "origin"]);
+        Ok(())
+    }
+
+    /// Fetches and fast-forwards a worktree to `origin/<branch>` — but only
+    /// when that is invisible to the user: the worktree must be clean and
+    /// the local branch must have no commits of its own. Returns whether an
+    /// update happened.
+    pub fn refresh_worktree(&self, org: &str, repo: &str, branch: &str) -> Result<bool> {
+        let bare = self.cfg.bare_repo_path(org, repo);
+        let wt = self.cfg.worktree_path(org, repo, branch);
+        if !bare.join("HEAD").exists() || !wt.join(".git").exists() {
+            return Ok(false);
+        }
+        self.run_git(Some(&bare), &["fetch", "--prune", "--no-tags", "origin"])?;
+        let upstream = format!("origin/{branch}");
+        let clean = self
+            .run_git(Some(&wt), &["status", "--porcelain"])
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(false);
+        if !clean {
+            return Ok(false);
+        }
+        // Both rev-lists fail if origin/<branch> doesn't exist (e.g. a new
+        // local-only branch) — treat that as nothing to do.
+        let ahead = self
+            .run_git(Some(&wt), &["rev-list", "--count", &format!("{upstream}..HEAD")]);
+        let behind = self
+            .run_git(Some(&wt), &["rev-list", "--count", &format!("HEAD..{upstream}")]);
+        match (ahead, behind) {
+            (Ok(a), Ok(b)) if a.trim() == "0" && b.trim() != "0" => {
+                info!("fast-forwarding {org}/{repo}@{branch} to {upstream}");
+                self.run_git(Some(&wt), &["merge", "--ff-only", &upstream])?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn map_not_found(&self, e: GitError, what: String) -> GitError {
         match e {
             GitError::CommandFailed { ref stderr, .. }
