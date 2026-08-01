@@ -86,6 +86,13 @@ branch operations:
   but only when it has no uncommitted changes and no local commits — your
   work is never touched. After a PR merges, `ls refs/main` shows the merged
   state without a manual pull.
+- **Foreign worktrees appear as symlinks**: if someone (say, a coding agent)
+  runs `git worktree add <random-dir> -b <branch>` directly, git forbids a
+  second checkout of that branch — so `refs/<branch>` shows up as a symlink
+  to wherever the worktree actually lives. `rm refs/<branch>` then deletes
+  that directory too (after verifying it really is a worktree of this repo),
+  along with the usual local + remote branch cleanup. The symlink target is
+  a server-side path, so it resolves for clients on the same machine.
 
 Notes:
 

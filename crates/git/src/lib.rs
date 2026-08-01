@@ -200,16 +200,87 @@ impl GitCache {
         Ok(wt)
     }
 
-    /// Deletes a branch everywhere: worktree directory, worktree
-    /// bookkeeping, local branch, and the remote branch. Local cleanup
-    /// errors are ignored (the pieces may already be gone); a failed remote
-    /// delete is only logged unless the remote ref was already absent.
+    /// All registered worktrees of a repo as (branch, path) pairs — both
+    /// ours and "foreign" ones created by running `git worktree add` in an
+    /// arbitrary directory. The bare entry and detached-HEAD worktrees are
+    /// skipped.
+    pub fn list_worktrees(&self, org: &str, repo: &str) -> Result<Vec<(String, PathBuf)>> {
+        let bare = self.cfg.bare_repo_path(org, repo);
+        if !bare.join("HEAD").exists() {
+            return Ok(Vec::new());
+        }
+        let out = self.run_git(Some(&bare), &["worktree", "list", "--porcelain"])?;
+        let mut result = Vec::new();
+        let mut path: Option<PathBuf> = None;
+        let mut branch: Option<String> = None;
+        let mut is_bare = false;
+        for line in out.lines().chain(std::iter::once("")) {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p));
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(b.to_string());
+            } else if line == "bare" {
+                is_bare = true;
+            } else if line.is_empty() {
+                if let (Some(p), Some(b), false) = (path.take(), branch.take(), is_bare) {
+                    result.push((b, p));
+                }
+                path = None;
+                branch = None;
+                is_bare = false;
+            }
+        }
+        Ok(result)
+    }
+
+    /// True if `path` holds a linked worktree of `bare` (its `.git` file
+    /// points into the bare repo's worktrees dir). Guards directory
+    /// deletion: `git worktree list` paths are attacker^W agent-controlled,
+    /// and we only ever remove directories that are really our checkouts.
+    fn is_worktree_of(path: &Path, bare: &Path) -> bool {
+        let Ok(content) = std::fs::read_to_string(path.join(".git")) else {
+            return false;
+        };
+        let Some(gitdir) = content.trim().strip_prefix("gitdir: ") else {
+            return false;
+        };
+        let Ok(gitdir) = std::fs::canonicalize(gitdir) else {
+            return false;
+        };
+        match std::fs::canonicalize(bare) {
+            Ok(bare) => gitdir.starts_with(bare.join("worktrees")),
+            Err(_) => false,
+        }
+    }
+
+    /// Deletes a branch everywhere: worktree directory (including a foreign
+    /// one created via `git worktree add` elsewhere), worktree bookkeeping,
+    /// local branch, and the remote branch. Local cleanup errors are ignored
+    /// (the pieces may already be gone); a failed remote delete is only
+    /// logged unless the remote ref was already absent.
     pub fn delete_branch(&self, org: &str, repo: &str, branch: &str) -> Result<()> {
         let wt = self.cfg.worktree_path(org, repo, branch);
         let _ = std::fs::remove_dir_all(&wt);
         let bare = self.cfg.bare_repo_path(org, repo);
         if !bare.join("HEAD").exists() {
             return Ok(());
+        }
+        // A foreign worktree holding this branch: delete its directory too,
+        // but only after verifying it really is a checkout of this repo.
+        if let Ok(worktrees) = self.list_worktrees(org, repo) {
+            for (b, path) in worktrees {
+                if b == branch && path != wt {
+                    if Self::is_worktree_of(&path, &bare) {
+                        info!("removing foreign worktree {} for {org}/{repo}@{branch}", path.display());
+                        let _ = std::fs::remove_dir_all(&path);
+                    } else {
+                        tracing::warn!(
+                            "not deleting {}: does not look like a worktree of {org}/{repo}",
+                            path.display()
+                        );
+                    }
+                }
+            }
         }
         let _ = self.run_git(Some(&bare), &["worktree", "prune"]);
         let _ = self.run_git(Some(&bare), &["branch", "-D", branch]);

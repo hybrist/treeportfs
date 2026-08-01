@@ -260,6 +260,62 @@ impl TreeportFs {
             .insert(key, base.clone());
         Ok(base)
     }
+
+    /// Branch → directory map of foreign worktrees (created by `git
+    /// worktree add` outside our cache), TTL-cached like the branch trie.
+    async fn get_foreign(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> std::collections::HashMap<String, PathBuf> {
+        let key = (org.to_string(), repo.to_string());
+        {
+            let st = self.state.lock().unwrap();
+            if let Some((map, at)) = st.foreign.get(&key) {
+                if at.elapsed() < self.git.config().branch_ttl {
+                    return map.clone();
+                }
+            }
+        }
+        let git = self.git.clone();
+        let (o, r) = key.clone();
+        let map: std::collections::HashMap<String, PathBuf> =
+            tokio::task::spawn_blocking(move || git.list_worktrees(&o, &r))
+                .await
+                .ok()
+                .and_then(|res| res.ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(branch, path)| {
+                    *path != self.git.config().worktree_path(org, repo, branch)
+                })
+                .collect();
+        self.state
+            .lock()
+            .unwrap()
+            .foreign
+            .insert(key, (map.clone(), Instant::now()));
+        map
+    }
+
+    fn symlink_attr(&self, id: fileid3, target: &Path) -> fattr3 {
+        let len = target.as_os_str().len() as u64;
+        fattr3 {
+            ftype: ftype3::NF3LNK,
+            mode: 0o777,
+            nlink: 1,
+            uid: self.owner.0,
+            gid: self.owner.1,
+            size: len,
+            used: len,
+            rdev: specdata3::default(),
+            fsid: 0,
+            fileid: id,
+            atime: self.started,
+            mtime: self.started,
+            ctime: self.started,
+        }
+    }
 }
 
 fn scan_cache(state: &mut State, cfg: &treeportfs_core::Config) {
@@ -433,6 +489,7 @@ impl NFSFileSystem for TreeportFs {
                         }
                     }
                 }
+                NodeKind::ForeignWorktree { .. } => return Err(nfsstat3::NFS3ERR_NOTDIR),
                 NodeKind::Worktree { .. } | NodeKind::Disk => {
                     if let Some(id) = existing {
                         LookupPlan::Done(id)
@@ -467,9 +524,47 @@ impl NFSFileSystem for TreeportFs {
                 st.touch(ROOT_ID);
                 Ok(repo_id)
             }
-            LookupPlan::Refs { org, repo, segs, existing } => {
-                let trie = self.get_trie(&org, &repo).await?;
+            LookupPlan::Refs { org, repo, segs, mut existing } => {
                 let name = segs.last().unwrap().clone();
+                let branch = segs.join("/");
+                // A branch checked out in a foreign worktree can't be
+                // materialized here (git refuses a second checkout), so it
+                // resolves to a symlink pointing at the real directory.
+                let foreign = self.get_foreign(&org, &repo).await;
+                if let Some(target) = foreign.get(&branch) {
+                    let mut st = self.state.lock().unwrap();
+                    let kind = NodeKind::ForeignWorktree { target: target.clone() };
+                    return Ok(match existing {
+                        Some(id) => {
+                            if let Some(n) = st.nodes.get_mut(&id) {
+                                n.kind = kind;
+                            }
+                            id
+                        }
+                        None => st.add_child(dirid, &name, kind),
+                    });
+                }
+                // Intermediate segment of a nested foreign branch
+                // (e.g. looking up `feature` when `feature/x` is foreign).
+                let prefix = format!("{branch}/");
+                if foreign.keys().any(|k| k.starts_with(&prefix)) {
+                    let mut st = self.state.lock().unwrap();
+                    return Ok(existing
+                        .unwrap_or_else(|| st.add_child(dirid, &name, NodeKind::RefPath)));
+                }
+                // No longer foreign (e.g. `git worktree remove` happened):
+                // drop the stale symlink node and resolve normally.
+                if let Some(id) = existing {
+                    let mut st = self.state.lock().unwrap();
+                    if matches!(
+                        st.get(id).map(|n| &n.kind),
+                        Some(NodeKind::ForeignWorktree { .. })
+                    ) {
+                        st.remove_child(dirid, &name);
+                        existing = None;
+                    }
+                }
+                let trie = self.get_trie(&org, &repo).await?;
                 let Some(tn) = trie.node(&segs) else {
                     // Not on the remote — but it may be a local-only branch
                     // (created via mkdir, not yet pushed) whose worktree
@@ -509,9 +604,12 @@ impl NFSFileSystem for TreeportFs {
         let path = {
             let st = self.state.lock().unwrap();
             let node = st.get(id).ok_or(nfsstat3::NFS3ERR_STALE)?;
-            match node.kind {
+            match &node.kind {
                 NodeKind::Worktree { .. } | NodeKind::Disk => {
                     st.disk_path(id).ok_or(nfsstat3::NFS3ERR_STALE)?
+                }
+                NodeKind::ForeignWorktree { target } => {
+                    return Ok(self.symlink_attr(id, target));
                 }
                 _ => return Ok(self.virtual_dir_attr(&st, id)),
             }
@@ -623,6 +721,11 @@ impl NFSFileSystem for TreeportFs {
                 return Err(nfsstat3::NFS3ERR_EXIST);
             }
             let branch = segs.join("/");
+            let foreign = self.get_foreign(&org, &repo).await;
+            let prefix = format!("{branch}/");
+            if foreign.contains_key(&branch) || foreign.keys().any(|k| k.starts_with(&prefix)) {
+                return Err(nfsstat3::NFS3ERR_EXIST);
+            }
             let base = self.default_branch_for(&org, &repo).await?;
             let _gate = self.git_gate.lock().await;
             let git = self.git.clone();
@@ -634,7 +737,8 @@ impl NFSFileSystem for TreeportFs {
             .map_err(|_| nfsstat3::NFS3ERR_IO)?
             .map_err(|e| match e {
                 GitError::CommandFailed { ref stderr, .. }
-                    if stderr.contains("already exists") =>
+                    if stderr.contains("already exists")
+                        || stderr.contains("already checked out") =>
                 {
                     nfsstat3::NFS3ERR_EXIST
                 }
@@ -672,7 +776,10 @@ impl NFSFileSystem for TreeportFs {
                         st.refs_context(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
                     segs.push(name.clone());
                     let child_is_worktree = dir.children.get(&name).is_some_and(|id| {
-                        matches!(st.get(*id).map(|n| &n.kind), Some(NodeKind::Worktree { .. }))
+                        matches!(
+                            st.get(*id).map(|n| &n.kind),
+                            Some(NodeKind::Worktree { .. } | NodeKind::ForeignWorktree { .. })
+                        )
                     });
                     Some((org, repo, segs, child_is_worktree))
                 }
@@ -682,12 +789,16 @@ impl NFSFileSystem for TreeportFs {
         if let Some((org, repo, segs, child_is_worktree)) = refs_ctx {
             if !child_is_worktree {
                 // Not materialized locally: only allow deleting things that
-                // are actually branches (not intermediate segments).
-                let trie = self.get_trie(&org, &repo).await?;
-                match trie.node(&segs) {
-                    Some(tn) if tn.is_branch => {}
-                    Some(_) => return Err(nfsstat3::NFS3ERR_ACCES),
-                    None => return Err(nfsstat3::NFS3ERR_NOENT),
+                // are actually branches (not intermediate segments) —
+                // remote branches from the trie, or foreign worktrees.
+                let foreign = self.get_foreign(&org, &repo).await;
+                if !foreign.contains_key(&segs.join("/")) {
+                    let trie = self.get_trie(&org, &repo).await?;
+                    match trie.node(&segs) {
+                        Some(tn) if tn.is_branch => {}
+                        Some(_) => return Err(nfsstat3::NFS3ERR_ACCES),
+                        None => return Err(nfsstat3::NFS3ERR_NOENT),
+                    }
                 }
             }
             let branch = segs.join("/");
@@ -706,9 +817,11 @@ impl NFSFileSystem for TreeportFs {
                 st.wt_refresh.remove(&id);
             }
             st.remove_child(dirid, &name);
-            // Force the next refs listing to re-query the remote so the
-            // deleted branch doesn't linger from the cached trie.
-            st.tries.remove(&(org, repo));
+            // Force the next refs listing to re-query the remote and the
+            // worktree list so the deleted branch doesn't linger from
+            // caches.
+            st.tries.remove(&(org.clone(), repo.clone()));
+            st.foreign.remove(&(org, repo));
             return Ok(());
         }
         if !valid_disk_name(&name) {
@@ -811,6 +924,7 @@ impl NFSFileSystem for TreeportFs {
                         st.refs_context(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
                     Plan::Refs { org, repo, segs }
                 }
+                NodeKind::ForeignWorktree { .. } => return Err(nfsstat3::NFS3ERR_NOTDIR),
                 NodeKind::Worktree { .. } | NodeKind::Disk => {
                     Plan::Disk(st.disk_path(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?)
                 }
@@ -826,6 +940,31 @@ impl NFSFileSystem for TreeportFs {
                 self.disk_entries(dirid, &path)?
             }
             Plan::Refs { org, repo, segs } => {
+                let foreign = self.get_foreign(&org, &repo).await;
+                // Foreign leaves and dir-segments visible at this level:
+                // for branch `a/b` with segs=[a], `b` is a symlink; with
+                // segs=[], `a` is an intermediate dir.
+                let mut foreign_links: std::collections::BTreeMap<String, PathBuf> =
+                    Default::default();
+                let mut foreign_dirs: std::collections::BTreeSet<String> = Default::default();
+                for (fbranch, target) in &foreign {
+                    let parts: Vec<&str> = fbranch.split('/').collect();
+                    if parts.len() > segs.len()
+                        && parts.iter().zip(&segs).all(|(p, s)| p == s)
+                    {
+                        let next = parts[segs.len()].to_string();
+                        if parts.len() == segs.len() + 1 {
+                            foreign_links.insert(next, target.clone());
+                        } else {
+                            foreign_dirs.insert(next);
+                        }
+                    }
+                }
+                if foreign.contains_key(&segs.join("/")) {
+                    // The listed dir itself is a foreign-checked-out branch:
+                    // it's a symlink, not a directory.
+                    return Err(nfsstat3::NFS3ERR_NOTDIR);
+                }
                 let trie = self.get_trie(&org, &repo).await?;
                 match trie.node(&segs) {
                     Some(tn) if tn.is_branch => {
@@ -837,7 +976,7 @@ impl NFSFileSystem for TreeportFs {
                     tn => {
                         // Remote branches from the trie, plus local-only
                         // branches (created via mkdir, not yet pushed) that
-                        // exist as worktree children.
+                        // exist as worktree children, plus foreign worktrees.
                         let mut names: std::collections::BTreeSet<String> = tn
                             .map(|t| t.children.keys().cloned().collect())
                             .unwrap_or_default();
@@ -857,22 +996,65 @@ impl NFSFileSystem for TreeportFs {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        // A path outside the trie with no local branches
-                        // doesn't exist; an empty-but-valid dir (e.g. refs of
-                        // a repo with no branches) lists as empty.
-                        if tn.is_none() && local.is_empty() {
+                        // A path outside the trie with no local or foreign
+                        // branches doesn't exist; an empty-but-valid dir
+                        // (e.g. refs of a repo with no branches) lists as
+                        // empty.
+                        if tn.is_none()
+                            && local.is_empty()
+                            && foreign_links.is_empty()
+                            && foreign_dirs.is_empty()
+                        {
                             return Err(nfsstat3::NFS3ERR_NOENT);
                         }
                         names.extend(local);
+                        names.extend(foreign_dirs);
+                        names.extend(foreign_links.keys().cloned());
+                        // Drop symlink nodes whose worktree disappeared.
+                        let stale: Vec<String> = st
+                            .get(dirid)
+                            .map(|d| {
+                                d.children
+                                    .iter()
+                                    .filter(|(n, id)| {
+                                        matches!(
+                                            st.get(**id).map(|x| &x.kind),
+                                            Some(NodeKind::ForeignWorktree { .. })
+                                        ) && !foreign_links.contains_key(*n)
+                                    })
+                                    .map(|(n, _)| n.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for n in stale {
+                            st.remove_child(dirid, &n);
+                            names.remove(&n);
+                        }
                         names
                             .into_iter()
                             .map(|name| {
-                                let id = st.add_child(dirid, &name, NodeKind::RefPath);
-                                let attr = match st.disk_path(id) {
-                                    Some(p) => self
-                                        .attr_for_path(id, &p)
-                                        .unwrap_or_else(|_| self.virtual_dir_attr(&st, id)),
-                                    None => self.virtual_dir_attr(&st, id),
+                                let (id, attr) = match foreign_links.get(&name) {
+                                    Some(target) => {
+                                        let kind = NodeKind::ForeignWorktree {
+                                            target: target.clone(),
+                                        };
+                                        let id = st.add_child(dirid, &name, kind.clone());
+                                        if let Some(n) = st.nodes.get_mut(&id) {
+                                            n.kind = kind;
+                                        }
+                                        (id, self.symlink_attr(id, target))
+                                    }
+                                    None => {
+                                        let id =
+                                            st.add_child(dirid, &name, NodeKind::RefPath);
+                                        let attr = match st.disk_path(id) {
+                                            Some(p) => self.attr_for_path(id, &p).unwrap_or_else(
+                                                |_| self.virtual_dir_attr(&st, id),
+                                            ),
+                                            None => self.virtual_dir_attr(&st, id),
+                                        };
+                                        (id, attr)
+                                    }
                                 };
                                 DirEntry {
                                     fileid: id,
@@ -908,6 +1090,12 @@ impl NFSFileSystem for TreeportFs {
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+        {
+            let st = self.state.lock().unwrap();
+            if let Some(NodeKind::ForeignWorktree { target }) = st.get(id).map(|n| &n.kind) {
+                return Ok(target.as_os_str().as_bytes().into());
+            }
+        }
         let path = self.disk_path_of(id, nfsstat3::NFS3ERR_INVAL)?;
         let target = std::fs::read_link(&path).map_err(io_err)?;
         Ok(target.as_os_str().as_bytes().into())
