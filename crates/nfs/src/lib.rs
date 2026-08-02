@@ -126,10 +126,7 @@ impl TreeportFs {
             Ok(branches) => {
                 let trie = Arc::new(BranchTrie::from_branches(&branches));
                 st.missing_repos.remove(&key);
-                let changed = st
-                    .tries
-                    .get(&key)
-                    .is_none_or(|old| *old.trie != *trie);
+                let changed = st.tries.get(&key).is_none_or(|old| *old.trie != *trie);
                 st.tries.insert(
                     key,
                     CachedTrie {
@@ -391,11 +388,7 @@ fn io_err(e: std::io::Error) -> nfsstat3 {
     }
 }
 
-fn paginate(
-    mut entries: Vec<DirEntry>,
-    start_after: fileid3,
-    max_entries: usize,
-) -> ReadDirResult {
+fn paginate(mut entries: Vec<DirEntry>, start_after: fileid3, max_entries: usize) -> ReadDirResult {
     let start = if start_after == 0 {
         0
     } else {
@@ -407,7 +400,11 @@ fn paginate(
             None => entries.len(),
         }
     };
-    let max = if max_entries == 0 { usize::MAX } else { max_entries };
+    let max = if max_entries == 0 {
+        usize::MAX
+    } else {
+        max_entries
+    };
     let remaining = entries.split_off(start);
     let end = remaining.len() <= max;
     ReadDirResult {
@@ -422,7 +419,10 @@ enum LookupPlan {
     /// An existing worktree: give it a chance to fetch/fast-forward first.
     Worktree(fileid3),
     /// Validate `org/<name>` against the remote, then create the repo node.
-    ProbeRepo { org: String, name: String },
+    ProbeRepo {
+        org: String,
+        name: String,
+    },
     /// Resolve a path in the refs namespace against the branch trie.
     Refs {
         org: String,
@@ -484,7 +484,10 @@ impl NFSFileSystem for TreeportFs {
                         LookupPlan::Done(id)
                     } else if valid_component(&name) {
                         let org = st.get(dirid).unwrap().name.clone();
-                        LookupPlan::ProbeRepo { org, name: name.clone() }
+                        LookupPlan::ProbeRepo {
+                            org,
+                            name: name.clone(),
+                        }
                     } else {
                         return Err(nfsstat3::NFS3ERR_NOENT);
                     }
@@ -514,7 +517,12 @@ impl NFSFileSystem for TreeportFs {
                             let (org, repo, mut segs) =
                                 st.refs_context(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
                             segs.push(name.clone());
-                            LookupPlan::Refs { org, repo, segs, existing }
+                            LookupPlan::Refs {
+                                org,
+                                repo,
+                                segs,
+                                existing,
+                            }
                         }
                     }
                 }
@@ -553,7 +561,12 @@ impl NFSFileSystem for TreeportFs {
                 st.touch(ROOT_ID);
                 Ok(repo_id)
             }
-            LookupPlan::Refs { org, repo, segs, mut existing } => {
+            LookupPlan::Refs {
+                org,
+                repo,
+                segs,
+                mut existing,
+            } => {
                 let name = segs.last().unwrap().clone();
                 let branch = segs.join("/");
                 // A branch checked out in a foreign worktree can't be
@@ -562,7 +575,9 @@ impl NFSFileSystem for TreeportFs {
                 let foreign = self.get_foreign(&org, &repo).await;
                 if let Some(target) = foreign.get(&branch) {
                     let mut st = self.state.lock().unwrap();
-                    let kind = NodeKind::ForeignWorktree { target: target.clone() };
+                    let kind = NodeKind::ForeignWorktree {
+                        target: target.clone(),
+                    };
                     return Ok(match existing {
                         Some(id) => {
                             if let Some(n) = st.nodes.get_mut(&id) {
@@ -578,8 +593,9 @@ impl NFSFileSystem for TreeportFs {
                 let prefix = format!("{branch}/");
                 if foreign.keys().any(|k| k.starts_with(&prefix)) {
                     let mut st = self.state.lock().unwrap();
-                    return Ok(existing
-                        .unwrap_or_else(|| st.add_child(dirid, &name, NodeKind::RefPath)));
+                    return Ok(
+                        existing.unwrap_or_else(|| st.add_child(dirid, &name, NodeKind::RefPath))
+                    );
                 }
                 // No longer foreign (e.g. `git worktree remove` happened):
                 // drop the stale symlink node and resolve normally.
@@ -599,15 +615,11 @@ impl NFSFileSystem for TreeportFs {
                 // branch up by name, then send lookups *into* it directly.
                 // Materialize it and resolve the name as a plain disk child.
                 let parent_segs = &segs[..segs.len() - 1];
-                if !parent_segs.is_empty()
-                    && trie.node(parent_segs).is_some_and(|p| p.is_branch)
-                {
+                if !parent_segs.is_empty() && trie.node(parent_segs).is_some_and(|p| p.is_branch) {
                     let root = self
                         .ensure_branch_dir(dirid, &org, &repo, parent_segs)
                         .await?;
-                    if !valid_disk_name(&name)
-                        || root.join(&name).symlink_metadata().is_err()
-                    {
+                    if !valid_disk_name(&name) || root.join(&name).symlink_metadata().is_err() {
                         return Err(nfsstat3::NFS3ERR_NOENT);
                     }
                     let mut st = self.state.lock().unwrap();
@@ -617,7 +629,10 @@ impl NFSFileSystem for TreeportFs {
                     // Not on the remote — but it may be a local-only branch
                     // (created via mkdir, not yet pushed) whose worktree
                     // survived a server restart.
-                    let wt = self.git.config().worktree_path(&org, &repo, &segs.join("/"));
+                    let wt = self
+                        .git
+                        .config()
+                        .worktree_path(&org, &repo, &segs.join("/"));
                     if wt.join(".git").exists() {
                         let mut st = self.state.lock().unwrap();
                         return Ok(st.add_child(dirid, &name, NodeKind::Worktree { root: wt }));
@@ -671,7 +686,12 @@ impl NFSFileSystem for TreeportFs {
         self.attr_for_path(id, &path)
     }
 
-    async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
+    async fn read(
+        &self,
+        id: fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let path = self.disk_path_of(id, nfsstat3::NFS3ERR_ISDIR)?;
         let mut f = File::open(&path).map_err(io_err)?;
         let len = f.metadata().map_err(io_err)?.len();
@@ -778,23 +798,22 @@ impl NFSFileSystem for TreeportFs {
             let _gate = self.git_gate.lock().await;
             let git = self.git.clone();
             let (o, r, b, base2) = (org.clone(), repo.clone(), branch.clone(), base.clone());
-            let root = tokio::task::spawn_blocking(move || {
-                git.create_branch_worktree(&o, &r, &b, &base2)
-            })
-            .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
-            .map_err(|e| match e {
-                GitError::CommandFailed { ref stderr, .. }
-                    if stderr.contains("already exists")
-                        || stderr.contains("already checked out") =>
-                {
-                    nfsstat3::NFS3ERR_EXIST
-                }
-                other => {
-                    warn!("branch creation {org}/{repo}@{branch} failed: {other}");
-                    nfsstat3::NFS3ERR_IO
-                }
-            })?;
+            let root =
+                tokio::task::spawn_blocking(move || git.create_branch_worktree(&o, &r, &b, &base2))
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                    .map_err(|e| match e {
+                        GitError::CommandFailed { ref stderr, .. }
+                            if stderr.contains("already exists")
+                                || stderr.contains("already checked out") =>
+                        {
+                            nfsstat3::NFS3ERR_EXIST
+                        }
+                        other => {
+                            warn!("branch creation {org}/{repo}@{branch} failed: {other}");
+                            nfsstat3::NFS3ERR_IO
+                        }
+                    })?;
             let mut st = self.state.lock().unwrap();
             let id = st.add_child(dirid, &name, NodeKind::Worktree { root: root.clone() });
             st.wt_refresh.insert(id, Instant::now());
@@ -931,7 +950,11 @@ impl NFSFileSystem for TreeportFs {
         enum Plan {
             Virtual(Vec<DirEntry>),
             Disk(PathBuf),
-            Refs { org: String, repo: String, segs: Vec<String> },
+            Refs {
+                org: String,
+                repo: String,
+                segs: Vec<String>,
+            },
         }
         let plan = {
             let st = self.state.lock().unwrap();
@@ -944,9 +967,7 @@ impl NFSFileSystem for TreeportFs {
                     let entries = dir
                         .children
                         .iter()
-                        .filter(|(_, id)| {
-                            st.get(**id).is_some_and(|n| !n.children.is_empty())
-                        })
+                        .filter(|(_, id)| st.get(**id).is_some_and(|n| !n.children.is_empty()))
                         .map(|(name, id)| DirEntry {
                             fileid: *id,
                             name: name.as_bytes().into(),
@@ -997,9 +1018,7 @@ impl NFSFileSystem for TreeportFs {
                 let mut foreign_dirs: std::collections::BTreeSet<String> = Default::default();
                 for (fbranch, target) in &foreign {
                     let parts: Vec<&str> = fbranch.split('/').collect();
-                    if parts.len() > segs.len()
-                        && parts.iter().zip(&segs).all(|(p, s)| p == s)
-                    {
+                    if parts.len() > segs.len() && parts.iter().zip(&segs).all(|(p, s)| p == s) {
                         let next = parts[segs.len()].to_string();
                         if parts.len() == segs.len() + 1 {
                             foreign_links.insert(next, target.clone());
@@ -1093,12 +1112,11 @@ impl NFSFileSystem for TreeportFs {
                                         (id, self.symlink_attr(id, target))
                                     }
                                     None => {
-                                        let id =
-                                            st.add_child(dirid, &name, NodeKind::RefPath);
+                                        let id = st.add_child(dirid, &name, NodeKind::RefPath);
                                         let attr = match st.disk_path(id) {
-                                            Some(p) => self.attr_for_path(id, &p).unwrap_or_else(
-                                                |_| self.virtual_dir_attr(&st, id),
-                                            ),
+                                            Some(p) => self
+                                                .attr_for_path(id, &p)
+                                                .unwrap_or_else(|_| self.virtual_dir_attr(&st, id)),
                                             None => self.virtual_dir_attr(&st, id),
                                         };
                                         (id, attr)

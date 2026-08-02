@@ -35,13 +35,17 @@ pub enum NodeKind {
     /// turns out to be a branch.
     RefPath,
     /// A fully-matched branch, backed by a materialized worktree on disk.
-    Worktree { root: PathBuf },
+    Worktree {
+        root: PathBuf,
+    },
     /// A branch checked out in a "foreign" worktree — one created by
     /// running `git worktree add <random-dir>` directly (e.g. by a coding
     /// agent). Git forbids checking the branch out a second time, so it
     /// can't be materialized at the canonical path; it appears as a symlink
     /// to wherever the worktree actually lives.
-    ForeignWorktree { target: PathBuf },
+    ForeignWorktree {
+        target: PathBuf,
+    },
     /// A file/dir/symlink inside a worktree; its real path is derived by
     /// climbing parents up to the `Worktree` root.
     Disk,
@@ -243,7 +247,10 @@ mod tests {
         );
         let sub = s.add_child(wt, "src", NodeKind::Disk);
         let file = s.add_child(sub, "lib.rs", NodeKind::Disk);
-        assert_eq!(s.disk_path(file), Some(PathBuf::from("/cache/wt/src/lib.rs")));
+        assert_eq!(
+            s.disk_path(file),
+            Some(PathBuf::from("/cache/wt/src/lib.rs"))
+        );
         assert_eq!(s.disk_path(wt), Some(PathBuf::from("/cache/wt")));
     }
 
