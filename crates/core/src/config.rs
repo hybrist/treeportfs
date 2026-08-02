@@ -29,7 +29,7 @@ impl Config {
     pub fn new(host: impl Into<String>) -> Self {
         Config {
             host: host.into(),
-            protocol: Protocol::Https,
+            protocol: Protocol::Ssh,
             cache_root: default_cache_root(),
             branch_ttl: Duration::from_secs(30),
             negative_ttl: Duration::from_secs(60),
@@ -83,9 +83,15 @@ mod tests {
     #[test]
     fn urls() {
         let mut c = Config::new("github.com");
-        assert_eq!(c.remote_url("rust-lang", "cargo"), "https://github.com/rust-lang/cargo.git");
-        c.protocol = Protocol::Ssh;
-        assert_eq!(c.remote_url("rust-lang", "cargo"), "git@github.com:rust-lang/cargo.git");
+        assert_eq!(
+            c.remote_url("rust-lang", "cargo"),
+            "git@github.com:rust-lang/cargo.git"
+        );
+        c.protocol = Protocol::Https;
+        assert_eq!(
+            c.remote_url("rust-lang", "cargo"),
+            "https://github.com/rust-lang/cargo.git"
+        );
     }
 
     #[test]
