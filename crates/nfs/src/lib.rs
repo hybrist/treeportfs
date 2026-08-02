@@ -565,6 +565,25 @@ impl NFSFileSystem for TreeportFs {
                     }
                 }
                 let trie = self.get_trie(&org, &repo).await?;
+                // The parent may itself be an unmaterialized branch: clients
+                // that obtained its filehandle from a readdir never look the
+                // branch up by name, then send lookups *into* it directly.
+                // Materialize it and resolve the name as a plain disk child.
+                let parent_segs = &segs[..segs.len() - 1];
+                if !parent_segs.is_empty()
+                    && trie.node(parent_segs).is_some_and(|p| p.is_branch)
+                {
+                    let root = self
+                        .ensure_branch_dir(dirid, &org, &repo, parent_segs)
+                        .await?;
+                    if !valid_disk_name(&name)
+                        || root.join(&name).symlink_metadata().is_err()
+                    {
+                        return Err(nfsstat3::NFS3ERR_NOENT);
+                    }
+                    let mut st = self.state.lock().unwrap();
+                    return Ok(st.add_child(dirid, &name, NodeKind::Disk));
+                }
                 let Some(tn) = trie.node(&segs) else {
                     // Not on the remote — but it may be a local-only branch
                     // (created via mkdir, not yet pushed) whose worktree

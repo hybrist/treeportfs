@@ -114,13 +114,16 @@ The VFS is a userspace **NFSv3 server on localhost** (no kernel extensions),
 mounted with `mount_nfs` on macOS or `mount -t nfs` on Linux (Linux needs
 root for the mount syscall).
 
-> **Warning — macOS 26/27 betas:** current Tahoe-era betas ship an NFS client
-> that wedges `open(2)` on directories of *any* NFS mount (no RPC is ever
-> sent; known Apple NFS regressions are tracked publicly). The server side
-> works — the full stack is verified end-to-end from a Linux NFS client
-> (browse, materialize, read/write, `git status/diff/commit` inside the
-> mount). On stable macOS releases the same `mount_nfs` approach is what
-> Xet et al. use in production.
+> **macOS note — network-volume permission:** the first time an app (your
+> terminal, editor, etc.) touches the mount, macOS asks for permission to
+> access **files on network volumes**. Until that prompt is answered, the
+> app's syscalls into the mount *block silently* — which looks exactly like
+> a hung filesystem: `stat` works, but `open()`/`ls` hang and the server
+> receives nothing (TCC intercepts above the filesystem layer). If the
+> mount "hangs", check for a pending consent dialog (System Settings →
+> Privacy & Security) before blaming the server. Once granted, the full
+> stack works natively on macOS; it is also verified end-to-end from Linux
+> NFS clients.
 
 ## Caveats / roadmap
 
