@@ -155,7 +155,10 @@ async fn main() -> Result<()> {
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
             }
-            info!("mounted at {}; Ctrl-C to unmount and exit", mountpoint.display());
+            info!(
+                "mounted at {}; Ctrl-C to unmount and exit",
+                mountpoint.display()
+            );
             tokio::signal::ctrl_c().await?;
             info!("unmounting {}", mountpoint.display());
             unmount(&mountpoint)?;

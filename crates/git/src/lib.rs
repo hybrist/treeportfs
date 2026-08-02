@@ -181,7 +181,9 @@ impl GitCache {
     pub fn local_heads(&self, org: &str, repo: &str) -> Result<Vec<String>> {
         let bare = self.cfg.bare_repo_path(org, repo);
         if !bare.join("HEAD").exists() {
-            return Err(GitError::RepoNotFound(format!("{org}/{repo} (no local clone)")));
+            return Err(GitError::RepoNotFound(format!(
+                "{org}/{repo} (no local clone)"
+            )));
         }
         let out = self.run_git(
             Some(&bare),
@@ -219,7 +221,13 @@ impl GitCache {
         self.run_git(
             Some(&bare),
             &[
-                "worktree", "add", "--no-track", "-b", branch, &wt_str, &start,
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                branch,
+                &wt_str,
+                &start,
             ],
         )?;
         self.run_git(
@@ -308,7 +316,10 @@ impl GitCache {
             for (b, path) in worktrees {
                 if b == branch && path != wt {
                     if Self::is_worktree_of(&path, &bare) {
-                        info!("removing foreign worktree {} for {org}/{repo}@{branch}", path.display());
+                        info!(
+                            "removing foreign worktree {} for {org}/{repo}@{branch}",
+                            path.display()
+                        );
                         let _ = std::fs::remove_dir_all(&path);
                     } else {
                         tracing::warn!(
@@ -354,10 +365,14 @@ impl GitCache {
         }
         // Both rev-lists fail if origin/<branch> doesn't exist (e.g. a new
         // local-only branch) — treat that as nothing to do.
-        let ahead = self
-            .run_git(Some(&wt), &["rev-list", "--count", &format!("{upstream}..HEAD")]);
-        let behind = self
-            .run_git(Some(&wt), &["rev-list", "--count", &format!("HEAD..{upstream}")]);
+        let ahead = self.run_git(
+            Some(&wt),
+            &["rev-list", "--count", &format!("{upstream}..HEAD")],
+        );
+        let behind = self.run_git(
+            Some(&wt),
+            &["rev-list", "--count", &format!("HEAD..{upstream}")],
+        );
         match (ahead, behind) {
             (Ok(a), Ok(b)) if a.trim() == "0" && b.trim() != "0" => {
                 info!("fast-forwarding {org}/{repo}@{branch} to {upstream}");
@@ -402,10 +417,10 @@ impl GitCache {
             "http.lowSpeedTime=20",
         ])
         .args(args)
-            // Never let a credential prompt hang the NFS server; if auth is
-            // missing the command fails and the path shows up as absent.
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=10");
+        // Never let a credential prompt hang the NFS server; if auth is
+        // missing the command fails and the path shows up as absent.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=10");
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
