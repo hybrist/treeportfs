@@ -25,9 +25,9 @@ struct ServeOpts {
     /// GitHub host to serve (use your GHE host for enterprise).
     #[arg(long, default_value = "github.com")]
     host: String,
-    /// Use SSH remotes (git@host:org/repo) instead of HTTPS.
+    /// Use HTTPS remotes instead of SSH (git@host:org/repo).
     #[arg(long)]
-    ssh: bool,
+    https: bool,
     /// Cache directory for bare repos and worktrees.
     #[arg(long)]
     cache: Option<PathBuf>,
@@ -58,8 +58,8 @@ enum Cmd {
 
 fn build_config(opts: &ServeOpts) -> Config {
     let mut cfg = Config::new(&opts.host);
-    if opts.ssh {
-        cfg.protocol = Protocol::Ssh;
+    if opts.https {
+        cfg.protocol = Protocol::Https;
     }
     if let Some(cache) = &opts.cache {
         cfg.cache_root = cache.clone();

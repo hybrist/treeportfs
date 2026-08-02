@@ -41,9 +41,9 @@ directory is a read-write passthrough to a real on-disk worktree in the cache
 git CLI commands (and editors, build tools, …) work inside the mount: they
 operate on a real worktree backed by a real (partial) clone.
 
-Shelling out to system git is deliberate: credential helpers (`gh auth`,
-osxkeychain, GHE tokens), proxies, and partial-clone/promisor fetching all
-behave exactly as they do in a normal clone.
+Shelling out to system git is deliberate: SSH keys/agents, credential helpers
+(`gh auth`, osxkeychain, GHE tokens), proxies, and partial-clone/promisor
+fetching all behave exactly as they do in a normal clone.
 
 ## Usage
 
@@ -54,8 +54,8 @@ treeportfs mount ~/github
 # GitHub Enterprise
 treeportfs mount ~/ghe --host github.example.corp
 
-# SSH remotes instead of HTTPS
-treeportfs mount ~/github --ssh
+# HTTPS remotes instead of the SSH default
+treeportfs mount ~/github --https
 
 # Server only (mount manually / from scripts)
 treeportfs serve --port 11111
@@ -102,9 +102,8 @@ Notes:
 - Repo lookups are validated against the remote; nonexistent (or
   unauthorized) repos show up as "No such file or directory". Auth failures
   are indistinguishable from missing repos, exactly like GitHub's own
-  behavior. Make sure `git ls-remote https://<host>/<org>/<repo>.git` works
-  in a terminal (i.e. your credential helper is set up) before blaming the
-  mount.
+  behavior. Make sure `git ls-remote git@<host>:<org>/<repo>.git` works in a
+  terminal (i.e. your SSH key or agent is set up) before blaming the mount.
 - First access to a branch of a big repo blocks on the partial clone; the
   clone is commits+trees only, so it is far cheaper than a full clone.
 
