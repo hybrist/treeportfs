@@ -147,15 +147,52 @@ impl GitCache {
     }
 
     /// The remote's default branch (symref target of HEAD), e.g. `main`.
+    ///
+    /// Falls back to the bare clone's own HEAD symref when the remote is
+    /// unreachable — `git clone --bare` records the remote's default branch
+    /// there, so this works offline for any repo we've cloned.
     pub fn default_branch(&self, org: &str, repo: &str) -> Result<String> {
         let url = self.cfg.remote_url(org, repo);
-        let out = self.run_git(None, &["ls-remote", "--symref", &url, "HEAD"])?;
+        let remote = self.run_git(None, &["ls-remote", "--symref", &url, "HEAD"]);
+        match remote {
+            Ok(out) => Ok(out
+                .lines()
+                .find_map(|l| l.strip_prefix("ref: refs/heads/"))
+                .and_then(|rest| rest.split('\t').next())
+                .unwrap_or("main")
+                .to_string()),
+            Err(e) => {
+                let bare = self.cfg.bare_repo_path(org, repo);
+                if !bare.join("HEAD").exists() {
+                    return Err(e);
+                }
+                let out = self.run_git(Some(&bare), &["symbolic-ref", "HEAD"])?;
+                out.trim()
+                    .strip_prefix("refs/heads/")
+                    .map(str::to_string)
+                    .ok_or(e)
+            }
+        }
+    }
+
+    /// Branch names from the bare clone's remote-tracking refs — the
+    /// last-fetched remote state, persisted by git itself. Errors if the
+    /// repo was never cloned.
+    pub fn local_heads(&self, org: &str, repo: &str) -> Result<Vec<String>> {
+        let bare = self.cfg.bare_repo_path(org, repo);
+        if !bare.join("HEAD").exists() {
+            return Err(GitError::RepoNotFound(format!("{org}/{repo} (no local clone)")));
+        }
+        let out = self.run_git(
+            Some(&bare),
+            &["for-each-ref", "--format=%(refname)", "refs/remotes/origin"],
+        )?;
         Ok(out
             .lines()
-            .find_map(|l| l.strip_prefix("ref: refs/heads/"))
-            .and_then(|rest| rest.split('\t').next())
-            .unwrap_or("main")
-            .to_string())
+            .filter_map(|r| r.strip_prefix("refs/remotes/origin/"))
+            .filter(|b| *b != "HEAD")
+            .map(str::to_string)
+            .collect())
     }
 
     /// Creates a new local branch + worktree forked from `origin/<base>`.
@@ -354,11 +391,21 @@ impl GitCache {
 
     fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
         let mut cmd = Command::new("git");
-        cmd.args(args)
+        // Bound network stalls: a transfer below 1 KB/s for 20s aborts, so a
+        // black-holing network (captive portal, dropped packets) can't pin a
+        // filesystem operation for git's default patience. Legitimate slow
+        // clones keep moving and are unaffected.
+        cmd.args([
+            "-c",
+            "http.lowSpeedLimit=1024",
+            "-c",
+            "http.lowSpeedTime=20",
+        ])
+        .args(args)
             // Never let a credential prompt hang the NFS server; if auth is
             // missing the command fails and the path shows up as absent.
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+            .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=10");
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }

@@ -133,9 +133,17 @@ root for the mount syscall).
 - `git worktree list` reports the cache paths (worktrees live in the cache
   and are *viewed* through the mount). Commands run inside the mount work
   normally.
-- Branch listings refresh after a 30s TTL (`--branch-ttl`); a stale listing
-  is served if the remote is unreachable, so cached repos remain browsable
-  offline.
+- **Offline**: everything previously fetched keeps working without a
+  network, across server restarts. Branch listings fall back to the bare
+  clone's last-fetched remote-tracking refs, the default branch comes from
+  the clone's HEAD symref, and worktree contents are plain local files —
+  so browsing, reading, git commands, and even `mkdir`-branching (when the
+  needed objects are local) all work offline. Remote effects are skipped
+  with a warning (`rm` leaves the remote branch); repos never accessed
+  before appear as nonexistent; and git operations that need unfetched
+  history objects fail as they would in any partial clone. Stalled network
+  transfers abort after 20s below 1 KB/s instead of hanging filesystem
+  operations. Branch listings refresh after a 30s TTL (`--branch-ttl`).
 - Concurrent first-touch clones are serialized; parallel materialization of
   independent repos is a future improvement.
 

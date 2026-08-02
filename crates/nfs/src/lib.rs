@@ -108,6 +108,19 @@ impl TreeportFs {
         let res = tokio::task::spawn_blocking(move || git.ls_remote_heads(&o, &r))
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        // If the remote is unreachable, the bare clone's remote-tracking
+        // refs hold the last-fetched branch list — resolved before taking
+        // the state lock since it shells out to git.
+        let local_heads = if res.is_err() {
+            let git = self.git.clone();
+            let (o, r) = key.clone();
+            tokio::task::spawn_blocking(move || git.local_heads(&o, &r))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        } else {
+            None
+        };
         let mut st = self.state.lock().unwrap();
         match res {
             Ok(branches) => {
@@ -135,6 +148,22 @@ impl TreeportFs {
                 if let Some(ct) = st.tries.get(&key) {
                     warn!("ls-remote {org}/{repo} failed ({e}); using stale branch list");
                     return Ok(ct.trie.clone());
+                }
+                // No in-memory copy (e.g. server restarted while offline):
+                // fall back to the last-fetched refs persisted in the bare
+                // clone. Inserted into the cache so only one warning is
+                // logged per TTL; the remote is retried after expiry.
+                if let Some(branches) = local_heads {
+                    warn!("ls-remote {org}/{repo} failed ({e}); using last-fetched refs");
+                    let trie = Arc::new(BranchTrie::from_branches(&branches));
+                    st.tries.insert(
+                        key,
+                        CachedTrie {
+                            trie: trie.clone(),
+                            fetched: Instant::now(),
+                        },
+                    );
+                    return Ok(trie);
                 }
                 debug!("ls-remote {org}/{repo} failed: {e}");
                 st.missing_repos.insert(key, Instant::now());
